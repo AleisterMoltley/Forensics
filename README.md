@@ -23,7 +23,7 @@ I built this instrument of revelation. A **forensic oracle** that watches every 
 
 1. **Detects** the launch via three simultaneous WebSocket listeners
 2. **Dispatches an instant deployer alert** if the wallet bears the mark of prior rugs (sub-millisecond, from an in-memory cache)
-3. **Runs six bundler detectors and four heuristic analyzers in parallel** against the token: same-slot bundle detection, funding fan-out analysis, bonding-curve reserve-buy accuracy, wash-trade fingerprinting, coordinated-exit timing, recovery-sweep SOL flows, deployer history, holder distribution, LP lock status, and contract patterns
+3. **Runs seven parallel analyzers** against the token: wallet history, holder distribution, liquidity lock status, bundled buy detection, contract patterns, social signals, and wallet clustering
 4. **Calculates a risk score** (0–100) blending heuristic weights with a trained Gradient Boosting classifier
 5. **Alerts your Telegram** with a detailed forensic report
 6. **Feeds a sniper bridge** for auto-sniping low-risk launches
@@ -99,16 +99,17 @@ All three fire into the same `_on_launch` callback. The Deployer Alert Network i
 
 *"Numbers are the language of the Abyss. Learn to read them."*
 
-Each token receives a composite risk score assembled from six dimension scores:
+Each token receives a composite risk score assembled from seven component scores:
 
 | Dimension | Weight | What the Oracle Examines |
 |---|---|---|
-| **Deployer History** | 25% | Wallet age, total launches, rug count, serial deployer patterns, funding source |
-| **Bundled Activity** | 20% | Six bundler sub-detectors (fan-out, same-slot, reserve buys, wash trades, coordinated exit, recovery sweep) |
-| **Holder Concentration** | 15% | Top-10 holder %, deviation from ideal distribution, early insider accumulation |
+| **Deployer History** | 20% | Wallet age, total launches, rug count, serial deployer patterns, funding source |
+| **Holder Concentration** | 20% | Top-10 holder %, deviation from ideal distribution, early insider accumulation |
 | **LP Status** | 15% | Is liquidity burned? Locked (how long)? Unlocked and withdrawable? |
+| **Bundled Buys + Clusters** | 15% | Coordinated multi-wallet purchases, common funding origin, sybil detection |
+| **Contract Patterns** | 15% | Mint authority retained, freeze authority active, copycat token detection |
 | **Social Signals** | 15% | Twitter/Telegram presence, bot-score, account age, follower authenticity |
-| **Contract Patterns** | 10% | Mint authority retained, freeze authority active, copycat token detection |
+| **Wallet Clustering** | *(within Bundled)* | Graph analysis of wallet funding chains |
 
 **Score interpretation:**
 
@@ -122,42 +123,28 @@ When the ML model is trained on ≥50 labelled samples, the final score blends h
 
 ---
 
-## ✦ The Bundler Codex — Six Detectors Reverse-Engineered From the Enemy
+## ✦ The Seven Analyzers — A Demonology
 
-*"To hunt the wolf, one must first understand how the wolf hunts."*
+### 1. `deployer.py` — *The Genealogist*
+Traces the deployer wallet's complete history via Helius RPC. Counts previous token launches, surfaces any confirmed rugs, calculates the wallet's age, and looks upstream at who funded the deployer. A wallet funded five minutes ago by another fresh wallet is a nine-circle alarm.
 
-The **Bundled Activity** dimension (20% of the total score) is itself a six-headed instrument, each component derived by reverse-engineering known bundler source code. The `bundler_orchestrator.py` runs all six in parallel and blends the results into a single `score_bundled` value.
+### 2. `holders.py` — *The Cartographer of Greed*
+Fetches the full holder list via Helius DAS API. Calculates concentration: what percentage of supply do the top 10 wallets hold? Computes a distribution score. Identifies insider accumulation — wallets that bought in the first block of trading.
 
-### 1. `funding_fanout.py` — *The Treasurer's Ledger*
-Derived from bundler `funding.ts`. A master wallet fans out the same SOL amount to N buyer wallets in batches of 8. This detector walks the deployer's recent outbound transfers, groups them by near-identical lamport value (within ±5%), and counts the fan-out. If those destination wallets later buy the launched token, the score ascends sharply. The batch size of 8 is a consecrated sigil of the bundler operator.
+### 3. `lp_check.py` — *The Locksmith*
+Examines the liquidity pool. Has the LP been burned to a dead address? Locked in a time-lock contract? Or is it sitting in the deployer's wallet, one transaction away from being drained? Unlocked LP is the most reliable single predictor of an impending rug.
 
-### 2. `same_slot_bundle.py` — *The Atomist*
-Derived from bundler `jito.ts`. Jito bundles are atomic: a token creation transaction and up to three buy transactions and a tip transaction all land in the same block slot. This detector finds the creation slot, counts all buy transactions within it, checks for a known Jito tip address transfer, and measures the bundle size. A tip of 950,000 lamports is the bundler's calling card.
+### 4. `bundled_buys.py` — *The Detective of Coordinated Deception*
+Analyses the first N transactions against the new pool. Detects wallets that bought within the same or adjacent slots. Traces those wallets back to a common funding source. Calculates what percentage of early volume was coordinated. This is the fingerprint of a pump team.
 
-### 3. `reserve_buys.py` — *The Bonding Curve Oracle*
-Derived from bundler `pumpfun.ts`. Pump.fun's constant-product curve is mathematically deterministic. A bot that pre-calculates the exact token output using the curve's virtual reserves will fill its order within a fraction of a percent of the theoretical maximum. Organic buyers, clicking through a UI, overpay or under-receive. This detector replays the first buys and compares actual fills against the curve's prediction. Accuracy above 98% is not luck.
+### 5. `contract_patterns.py` — *The Hermeticist*
+Reads the token's on-chain program data. Is mint authority retained (meaning more supply can be conjured at will)? Is freeze authority active (meaning your tokens can be frozen)? Is the name or symbol a near-copy of a recently rugged token? The contract holds many confessions.
 
-### 4. `wash_trades.py` — *The Mirrored Market*
-Derived from bundler `volumeBot.ts`. The volume bot executes a 70/30 buy-to-sell ratio, buy amounts between 0.005–0.09 SOL, at a cadence of approximately one trade every five seconds with 30% jitter. This detector analyses inter-trade timing regularity, amount distribution tightness, buy ratio, and whether the trading wallets share a common funding source. Mechanical markets leave mechanical fingerprints.
+### 6. `social.py` — *The Augur of the Profane Web*
+Queries Twitter/X (if bearer token is provided) and Telegram for the token's social footprint. How old are the accounts? Are the followers real? Does the Telegram group exist? Is it populated by bots announcing the same message in rotation? A token with no real community is a ghost ship.
 
-### 5. `coordinated_exit.py` — *The Stampede Cartographer*
-Derived from bundler `autoSell.ts`. After hitting a profit target (default 35%) or trailing stop (20% from ATH), the bundle sells in a staggered sequence: the master wallet first at 50% of holdings, then all buyer wallets sequentially with a two-second stagger. This detector identifies burst-sell windows, measures the stagger interval, checks whether the deployer sold first, and counts linked sellers. The stampede has a choreographer.
-
-### 6. `recovery_sweep.py` — *The Dust Collector*
-Derived from bundler `recover.ts`. After exit, the operator sweeps remaining SOL from all buyer wallets back to the master address: `balance - 5000 lamports` per wallet, processed sequentially. This detector looks for N-to-1 SOL flows matching that precise `balance - 5000` pattern after trading ceases. When the broom appears, the conjurer has already left the building.
-
----
-
-*The orchestrator weights these sub-scores as follows:*
-
-| Sub-Detector | Weight | When It Fires |
-|---|---|---|
-| `same_slot_bundle` | 25% | Pre-launch (creation block) |
-| `funding_fanout` | 20% | Pre-launch (deployer history) |
-| `wash_trades` | 15% | During trading |
-| `coordinated_exit` | 15% | Post-peak |
-| `reserve_buys` | 15% | Early trades |
-| `recovery_sweep` | 10% | Post-rug |
+### 7. `wallet_clusters.py` — *The Graph Weaver*
+Constructs a directed graph of wallet relationships based on funding chains and co-trading patterns. Identifies clusters — groups of wallets that appear to be controlled by the same entity. The size and centrality of the largest cluster is a powerful rug signal.
 
 ---
 
@@ -173,7 +160,7 @@ The ML subsystem is built on **scikit-learn's GradientBoostingClassifier** with 
   New token launched
         │
         ▼
-  Analysis (6 dimensions, 10 detectors) → features extracted → stored in DB
+  Analysis (7 analyzers) → 36 features extracted → stored in DB
         │
         ▼
   Outcome Tracker checks price at +1h, +6h, +24h
@@ -192,7 +179,7 @@ The ML subsystem is built on **scikit-learn's GradientBoostingClassifier** with 
                                      Next token scores better
 ```
 
-The AutoRetrainer runs every 6 hours within the process. For external scheduled retraining, trigger a `/train` command via Telegram or call the `/api/backtest` endpoint manually.
+The retrain also runs on a GitHub Actions schedule (`retrain.yml`) at 4 AM UTC daily, allowing training against the full historical dataset even between restarts.
 
 ---
 
@@ -252,15 +239,15 @@ On startup, the network loads from the database, auto-populates the watchlist fr
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/AleisterMoltley/Forensics.git
-cd Forensics
+git clone https://github.com/AleisterMoltley/Token-Forensics.git
+cd Token-Forensics
 
 # 2. Run the setup script (creates venv, installs deps, copies config template)
 bash setup.sh
 
 # 3. Fill in your credentials
-cp .env.example .env
-nano .env      # set HELIUS_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ADMIN_API_KEY
+cp config/.env.example config/.env
+nano config/.env      # set HELIUS_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 # 4. Activate the environment
 source .venv/bin/activate
@@ -298,15 +285,10 @@ railway variables set HELIUS_API_KEY=your_helius_key
 railway variables set TELEGRAM_BOT_TOKEN=your_bot_token
 railway variables set TELEGRAM_CHAT_ID=your_chat_id
 
-# 6. Set the security secrets (see RAILWAY_SECRETS.md for full checklist)
-railway variables set ADMIN_API_KEY=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
-railway variables set TELEGRAM_OWNER_IDS=your_telegram_user_id
-railway variables set DASHBOARD_ORIGIN=https://your-app.up.railway.app
-
-# 7. Deploy
+# 6. Deploy
 railway up
 
-# 8. (Optional) Attach a custom domain
+# 7. (Optional) Attach a custom domain
 railway domain
 ```
 
@@ -324,40 +306,33 @@ Railway **automatically injects** `PORT`, `DATABASE_URL`, and `REDIS_URL` from t
 
 ## ✦ CI/CD — The Automated Pipeline
 
-The repository uses two automated workflows:
-
-### `security.yml` — Continuous Dependency Audit
-
-Every push to `main`, every pull request, and every Monday at 07:00 UTC triggers:
+Pushing to `main` triggers the full CI/CD chain:
 
 ```
 git push origin main
         │
         ▼
-  GitHub Actions: security.yml
-  ├─ pip-audit (CVE scan on requirements.in)
-  ├─ pip-audit (full transitive scan via requirements.txt)
-  └─ SARIF upload to GitHub Security tab
+  GitHub Actions: ci.yml
+  ├─ Lint (Ruff)
+  ├─ Test (pytest)
+  └─ Deploy to Railway (RAILWAY_TOKEN secret)
+        │
+        ▼
+  Railway: zero-downtime rolling deploy
+        │
+        ▼
+  /health endpoint polled until 200 OK
 ```
 
-Newly published CVEs in any direct or transitive dependency will surface as a failed check, even when no code has changed. Results appear in the repository's **Security → Code scanning** panel.
+Additionally, `.github/workflows/retrain.yml` runs daily at 04:00 UTC — triggering a full ML model retrain against the accumulated historical data.
 
-### `dependabot.yml` — Automated Dependency Updates
-
-Every Wednesday at 06:00 AM (Europe/Berlin timezone), Dependabot opens pull requests for outdated Python packages and GitHub Actions versions. Minor and patch updates are grouped into a single PR. Major bumps receive individual PRs. Security updates bypass the schedule and open immediately.
-
-**Setup Railway deployment:**
+**Setup CI:**
 ```bash
-# 1. Install Railway CLI
-npm i -g @railway/cli
-railway login
+# Add your Railway token to GitHub Actions secrets
+gh secret set RAILWAY_TOKEN
 
-# 2. Initialise and deploy (see RAILWAY_SECRETS.md for the full checklist)
-railway init
-railway add postgresql
-railway variables set HELIUS_API_KEY=your_helius_key
-railway variables set ADMIN_API_KEY=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
-railway up
+# From now on, every push to main auto-deploys
+git push origin main
 ```
 
 ---
@@ -419,19 +394,13 @@ The FastAPI dashboard runs on port 8080 (or `$PORT` on Railway) and exposes:
 
 ## ✦ Environment Configuration — The Sigil Sheet
 
-Copy `.env.example` to `.env` and fill in your values. On Railway, set these as environment variables in the dashboard instead. See `RAILWAY_SECRETS.md` for the complete deployment checklist.
+Copy `.env.example` to `config/.env` and fill in your values. On Railway, set these as environment variables in the dashboard instead.
 
 ```bash
 # ─── REQUIRED ──────────────────────────────────────────────────────
 HELIUS_API_KEY=                  # Solana RPC. Get at helius.dev
 TELEGRAM_BOT_TOKEN=              # @BotFather
 TELEGRAM_CHAT_ID=                # Your private or group chat ID
-
-# ─── SECURITY ──────────────────────────────────────────────────────
-# Generate: python -c "import secrets; print(secrets.token_urlsafe(32))"
-ADMIN_API_KEY=                   # Protects /api/*, /ws, /export, /train endpoints
-TELEGRAM_OWNER_IDS=              # Comma-separated Telegram IDs for privileged commands
-DASHBOARD_ORIGIN=                # Your Railway domain for CORS (e.g. https://app.up.railway.app)
 
 # ─── DATABASE ──────────────────────────────────────────────────────
 # Local dev: SQLite is used automatically (no config needed)
@@ -473,13 +442,14 @@ POST_RUG_CHECK_INTERVAL=300      # Seconds between fund-trace sweeps
 ## ✦ Project Structure — The Anatomy of the Machine
 
 ```
-Forensics/
+Token-Forensics/
 │
 ├── src/
 │   ├── main.py                     # Orchestrator — ForensicsBot class, startup sequence
-│   ├── config.py                   # Settings (pydantic-settings) + Railway auto-detection + secret redaction
+│   ├── config.py                   # Settings (pydantic-settings) + Railway auto-detection
 │   ├── models.py                   # SQLAlchemy async models (TokenLaunch, Deployer, AlertConfig)
-│   ├── pipeline.py                 # Forensic analysis pipeline — runs all dimensions in parallel
+│   ├── pipeline.py                 # Forensic analysis pipeline — runs 7 analyzers in parallel
+│   ├── scoring.py                  # Risk score aggregation + ML blend logic
 │   ├── ml_model.py                 # GBM predictor + AutoRetrainer (6h cycle)
 │   ├── rpc.py                      # Helius RPC + DAS API async client
 │   ├── dashboard.py                # FastAPI app — REST API + WebSocket broadcast
@@ -497,28 +467,31 @@ Forensics/
 │   │   └── migration.py            # Pump.fun→Raydium migration detector + analyzer
 │   │
 │   └── analyzers/
-│       ├── rpc.py                  # Dedicated TTL-cached RPC client for analyzers
-│       ├── bundler_orchestrator.py # Orchestrates all 6 bundler sub-detectors
-│       ├── funding_fanout.py       # Master-wallet fan-out detection (from bundler funding.ts)
-│       ├── same_slot_bundle.py     # Jito same-slot bundle detection (from bundler jito.ts)
-│       ├── reserve_buys.py         # Bonding-curve reserve-buy accuracy (from bundler pumpfun.ts)
-│       ├── wash_trades.py          # Volume-bot wash-trade fingerprinting (from bundler volumeBot.ts)
-│       ├── coordinated_exit.py     # Staggered multi-wallet dump detection (from bundler autoSell.ts)
-│       ├── recovery_sweep.py       # Post-rug SOL sweep detection (from bundler recover.ts)
+│       ├── deployer.py             # Deployer wallet forensics
+│       ├── holders.py              # Holder concentration + distribution scoring
+│       ├── lp_check.py             # LP burn/lock/unlock detection
+│       ├── bundled_buys.py         # Coordinated buy detection
+│       ├── contract_patterns.py    # Mint/freeze authority + copycat detection
+│       ├── social.py               # Twitter + Telegram social scoring
+│       ├── wallet_clusters.py      # Graph-based wallet cluster analysis
 │       ├── outcome_tracker.py      # 1h/6h/24h outcome labelling + CSV export
 │       └── post_rug_tracker.py     # Post-rug SOL flow tracer + auto-watchlist
 │
-├── .github/
-│   ├── workflows/
-│   │   └── security.yml            # pip-audit CVE scan + lock-file drift check
-│   └── dependabot.yml              # Automated weekly dependency update PRs
+├── tests/
+│   └── test_forensics.py           # Pytest test suite
 │
-├── RAILWAY_SECRETS.md              # Deployment secrets checklist (no actual values)
-├── .env.example                    # Environment variable template
+├── .github/
+│   └── workflows/
+│       ├── ci.yml                  # Lint → Test → Deploy pipeline
+│       └── retrain.yml             # Scheduled daily ML retrain (04:00 UTC)
+│
+├── config/
+│   └── .env.example                # Environment variable template
+│
 ├── Dockerfile                      # Railway-optimised container (python:3.11-slim)
 ├── railway.toml                    # Railway deployment configuration
-├── requirements.in                 # Direct Python dependencies (pip-compile input)
-└── requirements.txt                # Fully pinned + hashed lockfile
+├── requirements.txt                # Python dependencies
+└── pyproject.toml                  # Ruff linter + pytest configuration
 ```
 
 ---
@@ -620,13 +593,10 @@ When `python -m src.main` is invoked, the following 15-step initialisation seque
 
 | Symptom | Cause | Remedy |
 |---|---|---|
-| `❌ HELIUS_API_KEY is required` | Missing env variable | Set `HELIUS_API_KEY` in `.env` or Railway variables |
+| `❌ HELIUS_API_KEY is required` | Missing env variable | Set `HELIUS_API_KEY` in `config/.env` or Railway variables |
 | `⚠️ Using SQLite on Railway` | No PostgreSQL addon | Run `railway add postgresql` |
-| Dashboard returns 401 | Missing `ADMIN_API_KEY` header | Set `ADMIN_API_KEY` and pass it as `X-API-Key` header |
 | Dashboard returns 503 | Port mismatch | Railway sets `PORT` automatically; ensure you're not overriding it |
 | No Telegram alerts | Bot token or chat ID missing | Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` |
-| `/export` or `/train` rejected | `TELEGRAM_OWNER_IDS` not set | Add your Telegram user ID to `TELEGRAM_OWNER_IDS` |
-| Browser frontend CORS error | `DASHBOARD_ORIGIN` not set | Set `DASHBOARD_ORIGIN` to your Railway domain |
 | ML model `WAITING FOR DATA` | Fewer than 50 labelled samples | Let the system run until outcomes are labelled; or `/train` after 50+ |
 | WebSocket keeps reconnecting | Helius rate limit | Check your Helius plan; reduce `SCAN_CONCURRENCY` |
 | High memory usage | Large deployer cache | Normal; the cache is bounded by the `deployers` table size |
