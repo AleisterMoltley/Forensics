@@ -52,9 +52,42 @@ class _SecretRedactor:
             r"\1…\2",
         ))
 
+    # JSON blobs longer than this many characters are replaced with a
+    # size annotation.  This prevents stack-traces containing full RPC
+    # response bodies or transaction payloads from flooding the logs.
+    _JSON_TRUNCATE_THRESHOLD: int = 200
+
+    # Matches a JSON object `{...}` or array `[...]` whose content is at least
+    # _JSON_TRUNCATE_THRESHOLD characters long.  `[\s\S]{N,}?` uses DOTALL
+    # semantics (matches any character including braces and newlines) with a
+    # non-greedy quantifier so each outermost blob is matched independently.
+    # This correctly handles nested structures such as `{"a": {"b": "c"}}`.
+    _JSON_BLOB_RE: re.Pattern[str] = re.compile(
+        rf"(\{{[\s\S]{{{_JSON_TRUNCATE_THRESHOLD},}}?\}}|\[[\s\S]{{{_JSON_TRUNCATE_THRESHOLD},}}?\])",
+        re.DOTALL,
+    )
+
+    def _truncate_json_payloads(self, msg: str) -> str:
+        """Replace large inline JSON blobs with a size annotation.
+
+        Why: RPC responses, WebSocket frames, and Pydantic validation errors
+        often include multi-kilobyte JSON that is useless in a log line and
+        may contain wallet addresses or other sensitive fields that were not
+        individually registered for redaction.
+        """
+        def _replace(m: re.Match[str]) -> str:
+            blob = m.group(0)
+            return f"[JSON payload redacted — {len(blob)} bytes]"
+
+        return self._JSON_BLOB_RE.sub(_replace, msg)
+
     def __call__(self, record: dict) -> bool:
         """Called by loguru for every log record; mutates message in-place."""
         msg: str = record["message"]
+        # 1. Truncate large JSON payloads before other redactions so that
+        #    wallet addresses embedded inside them are caught in bulk.
+        msg = self._truncate_json_payloads(msg)
+        # 2. Redact registered literal secrets and wallet address patterns.
         for pattern, replacement in self._patterns:
             msg = pattern.sub(replacement, msg)
         record["message"] = msg
