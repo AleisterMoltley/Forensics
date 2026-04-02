@@ -31,4 +31,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:${PORT}/health || exit 1
 
 # Use exec form so SIGTERM reaches Python directly (important for Railway deploys)
-CMD ["python", "-u", "-m", "src.main"]
+CMD ["python", "-u", "main.py"]

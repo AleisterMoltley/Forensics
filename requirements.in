@@ -144,11 +144,21 @@ loguru==0.7.3
 # ----------------------------------------------------------
 # Machine Learning
 # ----------------------------------------------------------
-# scikit-learn: rug-pull risk model (RandomForestClassifier + pipeline).
-# 1.6.x — avoid <1.3 which had a pickle arbitrary-code-execution issue
-# when loading untrusted model files (mitigated: models are trained
-# in-process and never loaded from untrusted sources).
+# scikit-learn: rug-pull risk model (GradientBoostingClassifier).
+# 1.6.x — avoid <1.3 which had a pickle arbitrary-code-execution issue.
 scikit-learn==1.6.1
+
+# joblib: model serialization fallback.  Bundled with scikit-learn but
+# pinned explicitly for visibility and auditability.
+# ⚠️  joblib uses pickle internally — see skops below for safer alternative.
+joblib>=1.3.0
+
+# skops: RECOMMENDED — pickle-free model serialization.
+# Eliminates the RCE risk inherent in pickle/joblib deserialization.
+# The bot auto-detects skops at runtime; if not installed, falls back to
+# joblib with HMAC signature verification + type validation.
+# Install: pip install skops
+# skops>=0.9.0
 
 # numpy: array math used by scikit-learn and feature engineering.
 # 2.x (ABI break from 1.x) — required by scikit-learn ≥1.6.

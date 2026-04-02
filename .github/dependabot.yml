@@ -1,0 +1,42 @@
+# Dependabot — automated dependency update PRs
+#
+# Creates PRs weekly for outdated or vulnerable Python packages.
+# PRs trigger the security.yml workflow automatically (pip-audit runs
+# on every PR), so vulnerable updates are caught before merge.
+#
+# Docs: https://docs.github.com/en/code-security/dependabot
+
+version: 2
+updates:
+  # Python dependencies (pip)
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "wednesday"
+      time: "06:00"
+      timezone: "Europe/Berlin"
+    # Group minor/patch updates into a single PR to reduce noise
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    # Keep PRs manageable — major bumps get individual PRs
+    open-pull-requests-limit: 10
+    # Security updates bypass the schedule and open immediately
+    # (this is Dependabot's default behavior)
+    labels:
+      - "dependencies"
+      - "security"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+
+  # GitHub Actions versions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "ci"

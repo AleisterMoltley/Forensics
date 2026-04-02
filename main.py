@@ -2,6 +2,7 @@
 import asyncio
 import signal
 import sys
+import time
 from pathlib import Path
 from loguru import logger
 import uvicorn
@@ -67,7 +68,7 @@ class ForensicsBot:
         if not settings.is_railway:
             Path("data").mkdir(exist_ok=True)
 
-        self._start_time = __import__("time").time()
+        self._start_time = time.time()
 
         # 1. Init database
         logger.info("Initializing database...")
@@ -100,6 +101,8 @@ class ForensicsBot:
         # 8. Init ML auto-retrainer
         self.auto_retrainer = AutoRetrainer(self.session_factory)
         self.pipeline.predictor = self.auto_retrainer.predictor
+        # Expose on dashboard app.state so /api/train can trigger retraining
+        self.dashboard_app.state.auto_retrainer = self.auto_retrainer
 
         # 9. Init deployer alert network
         self.deployer_network = DeployerAlertNetwork(self.session_factory)
@@ -135,20 +138,28 @@ class ForensicsBot:
             await self.queue.start_workers(self._process_queued_launch)
 
         # 14. Add health, metrics, backtest endpoints to dashboard
-        import time as _time
+        from fastapi import Request as _Request
         from fastapi.responses import PlainTextResponse, JSONResponse
+        from src.dashboard import limiter, RequireAdmin
 
         @self.dashboard_app.get("/health")
-        async def health():
-            """Railway healthcheck endpoint."""
-            uptime = _time.time() - (self._start_time or _time.time())
+        @limiter.limit("60/minute")
+        async def health(request: _Request):
+            """Railway healthcheck endpoint — minimal public response."""
+            return {"status": "ok"}
+
+        @self.dashboard_app.get("/api/health", dependencies=[RequireAdmin])
+        @limiter.limit("60/minute")
+        async def health_detailed(request: _Request):
+            """Detailed health info — protected to prevent operational recon."""
+            uptime = time.time() - (self._start_time or time.time())
             return {
                 "status": "ok",
                 "uptime_seconds": int(uptime),
                 "database": "connected",
                 "ws_connections": self._ws_status,
                 "last_scan_age_seconds": (
-                    int(_time.time() - self._last_scan_time)
+                    int(time.time() - self._last_scan_time)
                     if self._last_scan_time else None
                 ),
                 "ml_model_ready": (
@@ -157,20 +168,30 @@ class ForensicsBot:
                 ),
             }
 
-        @self.dashboard_app.get("/metrics", response_class=PlainTextResponse)
-        async def prometheus_metrics():
+        @self.dashboard_app.get(
+            "/metrics",
+            response_class=PlainTextResponse,
+            dependencies=[RequireAdmin],
+        )
+        @limiter.limit("30/minute")
+        async def prometheus_metrics(request: _Request):
+            """Prometheus metrics — protected to prevent operational recon."""
             return metrics.export_prometheus()
 
-        @self.dashboard_app.get("/api/metrics")
-        async def api_metrics():
+        @self.dashboard_app.get("/api/metrics", dependencies=[RequireAdmin])
+        @limiter.limit("60/minute")
+        async def api_metrics(request: _Request):
             data = metrics.export_json()
             if self.queue:
                 data["queue"] = self.queue.get_metrics()
                 data["queue"]["depth"] = await self.queue.get_depth()
+            # Helius RPC usage monitoring
+            data["rpc"] = rpc.stats
             return data
 
-        @self.dashboard_app.get("/api/backtest")
-        async def api_backtest():
+        @self.dashboard_app.get("/api/backtest", dependencies=[RequireAdmin])
+        @limiter.limit("5/minute")
+        async def api_backtest(request: _Request):
             from src.backtest import BacktestEngine
             engine = BacktestEngine(self.session_factory)
             result = await engine.run()
@@ -211,11 +232,11 @@ class ForensicsBot:
 
     async def _on_launch(self, launch: dict):
         """Callback when a new token launch is detected."""
-        import time
         start = time.time()
 
         try:
             deployer = launch.get("deployer", "")
+            alert = None  # must be defined before the queue check below
 
             # FAST PATH: Deployer alert network (<1ms)
             if self.deployer_network and deployer:
@@ -247,7 +268,6 @@ class ForensicsBot:
 
     async def _process_queued_launch(self, launch: dict):
         """Process a launch (called directly or from queue worker)."""
-        import time
         start = time.time()
 
         try:
@@ -342,11 +362,16 @@ class ForensicsBot:
             access_log=False,
         )
         server = uvicorn.Server(config)
+        self._dashboard_server = server
         await server.serve()
 
     async def shutdown(self):
         logger.info("Shutting down...")
         self._shutdown = True
+
+        # Graceful dashboard shutdown first (drains open connections)
+        if hasattr(self, "_dashboard_server") and self._dashboard_server:
+            self._dashboard_server.should_exit = True
 
         if self.pump_listener:
             await self.pump_listener.stop()
@@ -380,12 +405,12 @@ async def main():
 
     # Signal handlers — Railway sends SIGTERM on deploy
     # Try Unix signals, fall back gracefully on Windows/restricted containers
+    def _signal_shutdown():
+        asyncio.create_task(bot.shutdown())
+
     try:
         for sig_name in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(
-                sig_name,
-                lambda: asyncio.create_task(bot.shutdown()),
-            )
+            loop.add_signal_handler(sig_name, _signal_shutdown)
     except (NotImplementedError, OSError):
         # Windows or restricted container — shutdown on KeyboardInterrupt instead
         logger.warning("Signal handlers not supported, using KeyboardInterrupt fallback")

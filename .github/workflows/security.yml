@@ -1,18 +1,13 @@
 name: Security — Dependency Audit
 
-# Run on every push/PR that touches Python dependencies, and weekly to
-# catch newly-published CVEs even without code changes.
+# Run on EVERY push and PR (not just dependency file changes) to catch
+# newly-published CVEs even when code changes don't touch deps.
+# Also runs weekly and on manual trigger.
 on:
   push:
-    paths:
-      - "requirements.in"
-      - "requirements.txt"
-      - ".github/workflows/security.yml"
+    branches: [main]
   pull_request:
-    paths:
-      - "requirements.in"
-      - "requirements.txt"
-      - ".github/workflows/security.yml"
+    branches: [main]
   schedule:
     # Every Monday at 07:00 UTC
     - cron: "0 7 * * 1"
@@ -65,11 +60,19 @@ jobs:
           category: pip-audit
 
       # Re-run without SARIF and fail the job if vulnerabilities exist.
-      - name: Fail on vulnerabilities
+      - name: Fail on vulnerabilities (direct deps)
         run: |
           pip-audit \
             --requirement requirements.in \
             --desc
+
+      # Also audit the FULL locked dependency tree (transitive deps)
+      # to catch CVEs in sub-dependencies not listed in requirements.in.
+      - name: Audit transitive dependencies
+        run: |
+          pip install --require-hashes -r requirements.txt
+          pip-audit --desc
+        continue-on-error: false
 
   # -----------------------------------------------------------------------
   # Job 2: lock-file drift — verify requirements.txt is up-to-date with
