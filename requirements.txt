@@ -19,3 +19,4 @@ scikit-learn>=1.4.0
 numpy>=1.26.0
 redis>=5.0.0
 alembic>=1.13.0
+slowapi>=0.1.9
