@@ -1,0 +1,141 @@
+name: Security — Dependency Audit
+
+# Run on every push/PR that touches Python dependencies, and weekly to
+# catch newly-published CVEs even without code changes.
+on:
+  push:
+    paths:
+      - "requirements.in"
+      - "requirements.txt"
+      - ".github/workflows/security.yml"
+  pull_request:
+    paths:
+      - "requirements.in"
+      - "requirements.txt"
+      - ".github/workflows/security.yml"
+  schedule:
+    # Every Monday at 07:00 UTC
+    - cron: "0 7 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  # Required to upload SARIF results to GitHub Security tab
+  security-events: write
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Job 1: pip-audit — scan direct + transitive dependencies for CVEs
+  # -----------------------------------------------------------------------
+  pip-audit:
+    name: pip-audit (CVE scan)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pip-audit
+        run: pip install pip-audit==2.10.0
+
+      # Audit the pinned direct dependencies from requirements.in.
+      # --desc adds vulnerability descriptions to the output.
+      # --output sarif writes a SARIF file for the GitHub Security tab.
+      # Exit code 1 means vulnerabilities were found → fails the job.
+      - name: Run pip-audit on direct dependencies
+        run: |
+          pip-audit \
+            --requirement requirements.in \
+            --desc \
+            --output sarif \
+            --format sarif \
+            -o pip-audit-results.sarif
+        continue-on-error: true   # allow SARIF upload even on failure
+
+      - name: Upload SARIF results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: pip-audit-results.sarif
+          category: pip-audit
+
+      # Re-run without SARIF and fail the job if vulnerabilities exist.
+      - name: Fail on vulnerabilities
+        run: |
+          pip-audit \
+            --requirement requirements.in \
+            --desc
+
+  # -----------------------------------------------------------------------
+  # Job 2: lock-file drift — verify requirements.txt is up-to-date with
+  # requirements.in so hashes are never stale.
+  # -----------------------------------------------------------------------
+  lock-drift:
+    name: Lock-file drift check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pip-tools
+        run: pip install pip-tools
+
+      # Regenerate requirements.txt from requirements.in.
+      # If the result differs from what is committed, the job fails —
+      # instructing the developer to run pip-compile locally and commit
+      # the updated file.
+      - name: Regenerate lock file
+        run: |
+          pip-compile \
+            --generate-hashes \
+            --no-annotate \
+            --output-file requirements.txt \
+            requirements.in
+
+      - name: Check for uncommitted changes
+        run: |
+          if ! git diff --exit-code requirements.txt; then
+            echo ""
+            echo "❌ requirements.txt is out of date with requirements.in."
+            echo "   Run the following locally and commit the result:"
+            echo ""
+            echo "   pip install pip-tools"
+            echo "   pip-compile --generate-hashes --no-annotate \\"
+            echo "               --output-file requirements.txt requirements.in"
+            echo ""
+            exit 1
+          fi
+          echo "✅ requirements.txt matches requirements.in"
+
+  # -----------------------------------------------------------------------
+  # Job 3: hash-install — verify that pip --require-hashes installs cleanly
+  # -----------------------------------------------------------------------
+  hash-install:
+    name: pip --require-hashes install
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # This job deliberately uses --require-hashes so that any package
+      # without a matching hash causes an immediate, loud failure rather
+      # than a silent downgrade.
+      - name: Install with hash verification
+        run: pip install --require-hashes -r requirements.txt

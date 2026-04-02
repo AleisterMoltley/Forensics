@@ -6,7 +6,7 @@ from pathlib import Path
 from loguru import logger
 import uvicorn
 
-from src.config import settings, validate_env
+from src.config import settings, validate_env, setup_logging
 from src.models import init_db
 from src.pipeline import ForensicPipeline
 from src.scanners.pump_fun import PumpFunListener
@@ -25,17 +25,11 @@ from src.dashboard import create_app
 from src.rpc import rpc
 
 
-# Configure logging
-logger.remove()
-logger.add(
-    sys.stderr,
-    format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-    level="INFO",
-)
-if not settings.is_railway:
-    # Only write log files in local dev (Railway filesystem is ephemeral)
-    Path("data").mkdir(exist_ok=True)
-    logger.add("data/forensics.log", rotation="10 MB", retention="7 days", level="DEBUG")
+# Configure logging with secret-redaction filter (defined in config.py).
+# This replaces the raw logger.remove()/logger.add() calls so that the
+# Helius API key, Telegram token, and wallet addresses are automatically
+# stripped from every log record and file sink.
+setup_logging(settings)
 
 
 class ForensicsBot:
