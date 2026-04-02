@@ -1,0 +1,164 @@
+# ============================================================
+# Token Launch Forensics Bot — Direct Dependencies
+# ============================================================
+# This is the HUMAN-MAINTAINED source file.
+# Edit this file when you want to add, remove, or upgrade a
+# direct dependency, then regenerate the locked requirements:
+#
+#   pip install pip-tools
+#   pip-compile --generate-hashes --no-annotate \
+#               --output-file requirements.txt requirements.in
+#
+# Regenerate inside a container matching the target Python
+# version to get the correct platform wheel hashes:
+#
+#   docker run --rm -v $PWD:/app python:3.11-slim bash -c \
+#     "pip install pip-tools && pip-compile --generate-hashes \
+#      --no-annotate --output-file requirements.txt requirements.in"
+#
+# Security auditing:
+#   pip install pip-audit
+#   pip-audit -r requirements.in
+# ============================================================
+
+
+# ----------------------------------------------------------
+# Async HTTP client/server
+# ----------------------------------------------------------
+# aiohttp: used for all outbound Solana RPC / Helius API HTTP calls.
+# v3.13.3+ is required — earlier versions (≤3.13.2) are vulnerable to
+# a zip-bomb / auto_decompress DoS (GHSA-jwhx-xcg6-8xhj, CVE-2024-52304).
+aiohttp==3.13.3
+
+# websockets: WebSocket listener for Pump.fun / Raydium on-chain streams.
+# v14.x stabilised the connection-lifecycle API; no known CVEs in ≥12.0.
+websockets==14.2
+
+
+# ----------------------------------------------------------
+# Solana SDK
+# ----------------------------------------------------------
+# solders: low-level Rust-backed Solana types (keypairs, transactions,
+# pubkeys). Pinned to 0.26.x — 0.21 added critical Ed25519 batch-verify.
+solders==0.26.0
+
+# solana: high-level async RPC client wrapping solders.
+# 0.36.x corresponds to Solana mainnet v1.18+; no known CVEs.
+solana==0.36.6
+
+
+# ----------------------------------------------------------
+# Telegram Bot
+# ----------------------------------------------------------
+# python-telegram-bot v21+ (PTB): async-native via python-telegram-bot[job-queue].
+# v21.11.x is the latest stable release; v20 EOL in 2024.
+python-telegram-bot==21.11.1
+
+
+# ----------------------------------------------------------
+# Web Framework & ASGI
+# ----------------------------------------------------------
+# FastAPI: dashboard REST/WebSocket API layer.
+# v0.115.x — no known high/critical CVEs in 0.115.x as of 2025-Q2.
+# Avoid <0.95 which had an improper CORS origin handling issue.
+fastapi==0.115.12
+
+# uvicorn: ASGI server. Used both locally and in the Railway deployment.
+# 0.34.x ships with H11 ≥0.14 (HTTP/1.1 parser hardened against
+# header injection); no known CVEs in ≥0.27.
+uvicorn==0.34.2
+
+# slowapi: rate-limiting middleware for FastAPI/Starlette.
+# 0.1.9 is the current release; depends on limits which is pinned below.
+slowapi==0.1.9
+
+
+# ----------------------------------------------------------
+# Database / ORM
+# ----------------------------------------------------------
+# SQLAlchemy: async ORM for both SQLite (dev) and PostgreSQL (production).
+# 2.0.x (2-style API) required; 1.x support was dropped deliberately.
+# No known critical CVEs in ≥2.0.36.
+sqlalchemy==2.0.40
+
+# aiosqlite: async SQLite backend for SQLAlchemy in local dev.
+aiosqlite==0.21.0
+
+# asyncpg: high-performance async PostgreSQL driver (Railway / production).
+# 0.30.x adds support for PostgreSQL 16 logical replication protocol.
+asyncpg==0.30.0
+
+# psycopg2-binary: synchronous PostgreSQL driver used by Alembic migrations.
+# "binary" variant avoids build-time libpq dependency in Docker slim images.
+psycopg2-binary==2.9.10
+
+# Alembic: database schema migration tool, tightly coupled to SQLAlchemy.
+# 1.15.x required for SQLAlchemy 2.0 async compatibility.
+alembic==1.15.2
+
+
+# ----------------------------------------------------------
+# Data Validation
+# ----------------------------------------------------------
+# Pydantic v2: settings parsing, request/response models.
+# v2.11+ uses the Rust-backed pydantic-core for speed; v1 compatibility
+# shims are not used in this codebase.
+pydantic==2.11.3
+
+# pydantic-settings: reads settings from .env files and ENV vars.
+pydantic-settings==2.8.1
+
+
+# ----------------------------------------------------------
+# HTTP client
+# ----------------------------------------------------------
+# httpx: async HTTP client for social/Twitter API calls and healthchecks.
+# 0.28.x is the latest stable; no known CVEs in ≥0.27.
+httpx==0.28.1
+
+
+# ----------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------
+# python-dotenv: loads config/.env during local development.
+# Not used in Railway (ENV vars injected by the platform).
+python-dotenv==1.1.0
+
+
+# ----------------------------------------------------------
+# Encoding utilities
+# ----------------------------------------------------------
+# base58: Solana / Bitcoin-style address encoding/decoding.
+# Pure-Python; no known CVEs.
+base58==2.1.1
+
+
+# ----------------------------------------------------------
+# Logging
+# ----------------------------------------------------------
+# loguru: structured logging with secret-redaction filter.
+# No known CVEs; 0.7.x API is stable.
+loguru==0.7.3
+
+
+# ----------------------------------------------------------
+# Machine Learning
+# ----------------------------------------------------------
+# scikit-learn: rug-pull risk model (RandomForestClassifier + pipeline).
+# 1.6.x — avoid <1.3 which had a pickle arbitrary-code-execution issue
+# when loading untrusted model files (mitigated: models are trained
+# in-process and never loaded from untrusted sources).
+scikit-learn==1.6.1
+
+# numpy: array math used by scikit-learn and feature engineering.
+# 2.x (ABI break from 1.x) — required by scikit-learn ≥1.6.
+# No critical CVEs in ≥1.26; 2.2.x is the latest stable series.
+numpy==2.2.4
+
+
+# ----------------------------------------------------------
+# Cache / Queue
+# ----------------------------------------------------------
+# redis: async Redis client for the optional job queue (AnalysisQueue).
+# 5.x is the async-native client; 4.x and below are deprecated.
+redis==5.2.1
