@@ -77,45 +77,67 @@ class ForensicsBot:
         # 2. Init forensic pipeline
         self.pipeline = ForensicPipeline(self.session_factory)
 
-        # 3. Init Telegram
-        self.telegram = TelegramAlerts(self.session_factory, self.pipeline)
-        await self.telegram.start()
+        # ─── PRIORITY: Start dashboard FIRST so /health responds ───
+        # Railway's healthcheck starts immediately after the container
+        # launches.  We must have uvicorn listening before anything else.
 
-        # 4. Init dashboard
+        # 3. Init dashboard (creates FastAPI app + routes)
         self.dashboard_app = create_app(self.session_factory)
 
-        # 5. Init listeners
+        # 4. Register health + metrics endpoints EARLY
+        self._register_dashboard_endpoints()
+
+        # 5. Start dashboard server as a background task
+        dashboard_task = asyncio.create_task(self._run_dashboard(), name="dashboard")
+
+        # Give uvicorn a moment to bind the port before continuing
+        # so Railway's first healthcheck probe succeeds.
+        await asyncio.sleep(1.0)
+        logger.info(f"✅ Dashboard listening on :{settings.dashboard_port} — healthcheck should pass")
+
+        # ─── Now init everything else (non-blocking for healthcheck) ───
+
+        # 6. Init Telegram (polling can be slow — don't block startup)
+        self.telegram = TelegramAlerts(self.session_factory, self.pipeline)
+        try:
+            await asyncio.wait_for(self.telegram.start(), timeout=15.0)
+        except asyncio.TimeoutError:
+            logger.warning("Telegram start timed out (15s) — will retry in background")
+        except Exception as e:
+            logger.warning(f"Telegram start failed: {e} — bot disabled")
+
+        # 7. Init listeners
         self.pump_listener = PumpFunListener(on_launch=self._on_launch)
         self.raydium_listener = RaydiumListener(on_launch=self._on_launch)
 
-        # 6. Init migration listener + analyzer
+        # 8. Init migration listener + analyzer
         self.migration_analyzer = MigrationAnalyzer(self.session_factory)
         self.migration_listener = MigrationListener(
             on_migration=self._on_migration,
             session_factory=self.session_factory,
         )
 
-        # 7. Init outcome tracker
+        # 9. Init outcome tracker
         self.outcome_tracker = OutcomeTracker(self.session_factory)
 
-        # 8. Init ML auto-retrainer
+        # 10. Init ML auto-retrainer
         self.auto_retrainer = AutoRetrainer(self.session_factory)
         self.pipeline.predictor = self.auto_retrainer.predictor
         # Expose on dashboard app.state so /api/train can trigger retraining
         self.dashboard_app.state.auto_retrainer = self.auto_retrainer
 
-        # 9. Init deployer alert network
+        # 11. Init deployer alert network
         self.deployer_network = DeployerAlertNetwork(self.session_factory)
         await self.deployer_network.load()
         await self.deployer_network.auto_watchlist_from_rugs(min_rugs=2)
 
-        # 10. Init sniper bridge
+        # 12. Init sniper bridge
         self.sniper = SniperBridge(
             webhook_url=settings.sniper_webhook_url,
             signal_chat_id=settings.sniper_signal_chat_id,
         )
 
-        # 11. Init channel publisher
+        # 13. Init channel publisher
         self.channel = ChannelPublisher(
             channel_id=settings.channel_chat_id,
             bot=self.telegram.bot if self.telegram else None,
@@ -123,12 +145,12 @@ class ForensicsBot:
             max_score_for_gem=settings.channel_max_gem_score,
         )
 
-        # 12. Init post-rug tracker
+        # 14. Init post-rug tracker
         self.post_rug_tracker = PostRugTracker(
             self.session_factory, self.deployer_network,
         )
 
-        # 13. Init queue (optional Redis)
+        # 15. Init queue (optional Redis)
         self.queue = AnalysisQueue(
             redis_url=settings.redis_url,
             num_workers=settings.queue_workers,
@@ -137,9 +159,47 @@ class ForensicsBot:
             await self.queue.connect()
             await self.queue.start_workers(self._process_queued_launch)
 
-        # 14. Add health, metrics, backtest endpoints to dashboard
+        # 16. Start all background tasks
+        tasks = [
+            dashboard_task,
+            asyncio.create_task(self.pump_listener.start(), name="pump_fun"),
+            asyncio.create_task(self.raydium_listener.start(), name="raydium"),
+            asyncio.create_task(self.migration_listener.start(), name="migration"),
+            asyncio.create_task(self.outcome_tracker.start(), name="outcome_tracker"),
+            asyncio.create_task(self.auto_retrainer.start(), name="auto_retrainer"),
+        ]
+
+        if settings.post_rug_tracker_enabled:
+            tasks.append(asyncio.create_task(self.post_rug_tracker.start(), name="post_rug_tracker"))
+
+        logger.info("✅ All systems online")
+        logger.info(f"   Dashboard: http://{settings.dashboard_host}:{settings.dashboard_port}")
+        logger.info(f"   Telegram alerts: {'ON' if settings.telegram_bot_token else 'OFF'}")
+        logger.info(f"   Alert threshold: {settings.min_risk_score_alert}/100")
+        logger.info(f"   Outcome tracker: ON (1h/6h/24h checks)")
+        logger.info(f"   Migration listener: ON")
+        logger.info(f"   ML model: {'LOADED' if self.auto_retrainer.predictor.is_ready else 'WAITING FOR DATA'}")
+        logger.info(f"   Sniper bridge: {'ON' if settings.sniper_webhook_url else 'OFF'}")
+        logger.info(f"   Channel: {'ON' if settings.channel_chat_id else 'OFF'}")
+        logger.info(f"   Deployer network: {len(self.deployer_network._cache)} cached, {len(self.deployer_network._watchlist)} watchlisted")
+        logger.info(f"   Post-rug tracker: {'ON' if settings.post_rug_tracker_enabled else 'OFF'}")
+        logger.info(f"   Queue: {'Redis' if self.queue._use_redis else 'asyncio'}")
+        logger.info(f"   Metrics: http://{settings.dashboard_host}:{settings.dashboard_port}/metrics")
+
+        # Wait for shutdown
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            pass
+
+    def _register_dashboard_endpoints(self):
+        """Register health, metrics, backtest endpoints on the dashboard app.
+
+        Called early in startup so /health is available for Railway's
+        healthcheck probe before the bot's async services are ready.
+        """
         from fastapi import Request as _Request
-        from fastapi.responses import PlainTextResponse, JSONResponse
+        from fastapi.responses import PlainTextResponse
         from src.dashboard import limiter, RequireAdmin
 
         @self.dashboard_app.get("/health")
@@ -196,39 +256,6 @@ class ForensicsBot:
             engine = BacktestEngine(self.session_factory)
             result = await engine.run()
             return result.to_dict()
-
-        # 15. Start all tasks
-        tasks = [
-            asyncio.create_task(self.pump_listener.start(), name="pump_fun"),
-            asyncio.create_task(self.raydium_listener.start(), name="raydium"),
-            asyncio.create_task(self.migration_listener.start(), name="migration"),
-            asyncio.create_task(self.outcome_tracker.start(), name="outcome_tracker"),
-            asyncio.create_task(self.auto_retrainer.start(), name="auto_retrainer"),
-            asyncio.create_task(self._run_dashboard(), name="dashboard"),
-        ]
-
-        if settings.post_rug_tracker_enabled:
-            tasks.append(asyncio.create_task(self.post_rug_tracker.start(), name="post_rug_tracker"))
-
-        logger.info("✅ All systems online")
-        logger.info(f"   Dashboard: http://{settings.dashboard_host}:{settings.dashboard_port}")
-        logger.info(f"   Telegram alerts: {'ON' if settings.telegram_bot_token else 'OFF'}")
-        logger.info(f"   Alert threshold: {settings.min_risk_score_alert}/100")
-        logger.info(f"   Outcome tracker: ON (1h/6h/24h checks)")
-        logger.info(f"   Migration listener: ON")
-        logger.info(f"   ML model: {'LOADED' if self.auto_retrainer.predictor.is_ready else 'WAITING FOR DATA'}")
-        logger.info(f"   Sniper bridge: {'ON' if settings.sniper_webhook_url else 'OFF'}")
-        logger.info(f"   Channel: {'ON' if settings.channel_chat_id else 'OFF'}")
-        logger.info(f"   Deployer network: {len(self.deployer_network._cache)} cached, {len(self.deployer_network._watchlist)} watchlisted")
-        logger.info(f"   Post-rug tracker: {'ON' if settings.post_rug_tracker_enabled else 'OFF'}")
-        logger.info(f"   Queue: {'Redis' if self.queue._use_redis else 'asyncio'}")
-        logger.info(f"   Metrics: http://{settings.dashboard_host}:{settings.dashboard_port}/metrics")
-
-        # Wait for shutdown
-        try:
-            await asyncio.gather(*tasks)
-        except asyncio.CancelledError:
-            pass
 
     async def _on_launch(self, launch: dict):
         """Callback when a new token launch is detected."""

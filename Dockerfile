@@ -27,7 +27,8 @@ ENV PORT=8080
 EXPOSE ${PORT}
 
 # Healthcheck — Railway uses this to verify the service is up
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+# start-period=60s gives the bot time to init DB + start uvicorn
+HEALTHCHECK --interval=15s --timeout=10s --start-period=60s --retries=5 \
     CMD curl -f http://localhost:${PORT}/health || exit 1
 
 # Use exec form so SIGTERM reaches Python directly (important for Railway deploys)
