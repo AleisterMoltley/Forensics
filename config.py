@@ -3,11 +3,12 @@
 Railway sets DATABASE_URL (Postgres) and PORT automatically.
 Supports both local dev (SQLite) and Railway (PostgreSQL).
 """
+from __future__ import annotations
+
 import re
 import sys
-from typing import Optional
 from pydantic_settings import BaseSettings
-from pydantic import Field, model_validator
+from pydantic import model_validator
 from loguru import logger
 
 
@@ -74,7 +75,7 @@ def setup_logging(s: "Settings") -> None:
     _redactor.register(s.helius_api_key)
     _redactor.register(s.telegram_bot_token)
     _redactor.register(s.twitter_bearer_token)
-    _redactor.register(s.dashboard_api_key)
+    _redactor.register(s.admin_api_key)
     _redactor.register_wallet_pattern()
 
     logger.remove()
@@ -129,9 +130,10 @@ class Settings(BaseSettings):
     dashboard_port: int = 8080
     dashboard_host: str = "0.0.0.0"
     port: int = 0  # Railway PORT override
-    # API key required in X-API-Key header for all /api/* endpoints.
+    # API key required in X-API-Key header for all /api/* and /ws endpoints.
+    # Sourced from ADMIN_API_KEY env variable.
     # Leave empty to disable auth (development only — never in production).
-    dashboard_api_key: str = ""
+    admin_api_key: str = ""
 
     # Database — Railway sets DATABASE_URL for Postgres
     database_url: str = "sqlite+aiosqlite:///data/forensics.db"
@@ -226,8 +228,9 @@ settings = Settings()
 def validate_env() -> None:
     """Validate critical environment variables on startup.
 
-    Exits on fatal errors; logs warnings for non-fatal issues.
-    Secrets are never echoed — only their presence is checked.
+    Exits on fatal errors; logs non-fatal issues as warnings.
+    This function itself never logs secret values — it only checks
+    for presence and logs human-readable status messages.
     """
     fatal: list[str] = []
     warnings: list[str] = []
@@ -241,9 +244,9 @@ def validate_env() -> None:
     if not settings.telegram_chat_id:
         warnings.append("TELEGRAM_CHAT_ID not set — Telegram alerts disabled")
 
-    if not settings.dashboard_api_key and settings.is_railway:
+    if not settings.admin_api_key and settings.is_railway:
         warnings.append(
-            "DASHBOARD_API_KEY not set — dashboard endpoints are unprotected! "
+            "ADMIN_API_KEY not set — dashboard endpoints are unprotected! "
             "Set a strong random key before exposing the dashboard publicly."
         )
 
@@ -272,5 +275,5 @@ def validate_env() -> None:
     logger.info(f"   Database: {'PostgreSQL' if settings.is_postgres else 'SQLite'}")
     logger.info(f"   Railway: {'YES' if settings.is_railway else 'NO (local dev)'}")
     logger.info(f"   Port: {settings.dashboard_port}")
-    logger.info(f"   Dashboard auth: {'ON' if settings.dashboard_api_key else 'OFF (dev mode)'}")
+    logger.info(f"   Dashboard auth: {'ON' if settings.admin_api_key else 'OFF (dev mode)'}")
     logger.info(f"   Telegram owner IDs: {len(settings.owner_id_set)} configured")

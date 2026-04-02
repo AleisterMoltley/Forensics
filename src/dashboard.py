@@ -2,7 +2,8 @@
 
 Security design:
 - All /api/*, /ws, /export, /train, /backtest endpoints require a valid
-  X-API-Key header.  The key is set via DASHBOARD_API_KEY env variable.
+  X-API-Key header checked by the `require_admin` dependency.
+  The key is set via the ADMIN_API_KEY environment variable.
 - /health and /metrics are intentionally public so Railway's healthcheck
   and Prometheus scrapers work without credentials.
 - Rate limiting (slowapi) prevents brute-force and DoS on every endpoint.
@@ -19,9 +20,10 @@ import re
 import secrets
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from loguru import logger
 from pydantic import BaseModel, Field, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -86,27 +88,32 @@ class WalletAddressParam(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Authentication dependency
+# Authentication — require_admin dependency
 # ---------------------------------------------------------------------------
 
-def _verify_api_key(request: Request) -> None:
+# APIKeyHeader integrates with FastAPI's OpenAPI/Swagger UI: the "Authorize"
+# button appears automatically and the scheme is documented in the schema.
+# auto_error=False lets us return a custom 401 instead of FastAPI's default.
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def require_admin(api_key: str | None = Security(_api_key_header)) -> None:
     """FastAPI dependency that enforces X-API-Key header authentication.
 
-    Why: Without auth, the dashboard's /api endpoints expose deployer
-    histories, wallet addresses, backtest data, and training triggers to
-    anyone who can reach the host — a critical data-leak and abuse risk.
+    Reads ADMIN_API_KEY from settings and compares with the supplied header
+    value using `secrets.compare_digest` to prevent timing-based attacks.
 
-    If DASHBOARD_API_KEY is not configured (local dev), auth is skipped
-    with a warning so developers can iterate without friction.
+    If ADMIN_API_KEY is not configured (local dev), auth is skipped with a
+    warning so developers can iterate without friction.  In production,
+    always set a strong random value:
+        python -c "import secrets; print(secrets.token_urlsafe(32))"
     """
-    if not settings.dashboard_api_key:
+    if not settings.admin_api_key:
         # Auth disabled — acceptable only in local dev
         return
 
-    api_key = request.headers.get("X-API-Key", "")
-    # Use secrets.compare_digest to prevent timing attacks
     if not api_key or not secrets.compare_digest(
-        api_key.encode(), settings.dashboard_api_key.encode()
+        api_key.encode(), settings.admin_api_key.encode()
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -115,29 +122,8 @@ def _verify_api_key(request: Request) -> None:
         )
 
 
-RequireApiKey = Depends(_verify_api_key)
-
-
-def _verify_ws_token(token: str = Query(default="")) -> None:
-    """WebSocket auth via ?token= query parameter.
-
-    Why: Browser WebSocket APIs (and most WS clients) cannot set arbitrary
-    headers, so the API key is passed as a query parameter instead.
-    The token is checked with compare_digest to prevent timing attacks.
-    """
-    if not settings.dashboard_api_key:
-        return  # auth disabled in dev
-
-    if not token or not secrets.compare_digest(
-        token.encode(), settings.dashboard_api_key.encode()
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing WebSocket token",
-        )
-
-
-RequireWsToken = Depends(_verify_ws_token)
+# Convenience alias — use as `dependencies=[RequireAdmin]` on route decorators
+RequireAdmin = Depends(require_admin)
 
 
 # ---------------------------------------------------------------------------
@@ -225,10 +211,10 @@ def create_app(session_factory: async_sessionmaker[AsyncSession]) -> FastAPI:
         return JSONResponse(content={"info": "metrics not yet initialised"})
 
     # -----------------------------------------------------------------------
-    # Protected endpoints — require valid X-API-Key header
+    # Protected endpoints — require valid X-API-Key header (require_admin)
     # -----------------------------------------------------------------------
 
-    @app.get("/api/launches", dependencies=[RequireApiKey])
+    @app.get("/api/launches", dependencies=[RequireAdmin])
     @limiter.limit("30/minute")
     async def get_launches(
         request: Request,
@@ -265,7 +251,7 @@ def create_app(session_factory: async_sessionmaker[AsyncSession]) -> FastAPI:
                 for r in rows
             ]
 
-    @app.get("/api/deployers", dependencies=[RequireApiKey])
+    @app.get("/api/deployers", dependencies=[RequireAdmin])
     @limiter.limit("30/minute")
     async def get_deployers(
         request: Request,
@@ -296,7 +282,7 @@ def create_app(session_factory: async_sessionmaker[AsyncSession]) -> FastAPI:
                 for r in rows
             ]
 
-    @app.get("/api/lookup/{mint}", dependencies=[RequireApiKey])
+    @app.get("/api/lookup/{mint}", dependencies=[RequireAdmin])
     @limiter.limit("20/minute")
     async def lookup_mint(
         request: Request,
@@ -335,7 +321,7 @@ def create_app(session_factory: async_sessionmaker[AsyncSession]) -> FastAPI:
                 "launched_at": row.launched_at.isoformat() if row.launched_at else None,
             }
 
-    @app.get("/api/backtest", dependencies=[RequireApiKey])
+    @app.get("/api/backtest", dependencies=[RequireAdmin])
     @limiter.limit("5/minute")  # expensive — tighter limit
     async def api_backtest(request: Request) -> dict[str, Any]:
         """Run backtest engine against historical data.
@@ -356,7 +342,7 @@ def create_app(session_factory: async_sessionmaker[AsyncSession]) -> FastAPI:
         except ImportError:
             raise HTTPException(status_code=503, detail="Backtest engine not available")
 
-    @app.get("/api/metrics", dependencies=[RequireApiKey])
+    @app.get("/api/metrics", dependencies=[RequireAdmin])
     @limiter.limit("60/minute")
     async def api_metrics_detail(request: Request) -> dict[str, Any]:
         """Detailed JSON metrics (includes queue depth).
@@ -365,7 +351,7 @@ def create_app(session_factory: async_sessionmaker[AsyncSession]) -> FastAPI:
         """
         return {"info": "metrics endpoint — attach via main.py"}
 
-    @app.post("/api/train", dependencies=[RequireApiKey])
+    @app.post("/api/train", dependencies=[RequireAdmin])
     @limiter.limit("2/minute")  # training is very expensive
     async def trigger_training(request: Request) -> dict[str, str]:
         """Trigger ML model retraining.
@@ -375,7 +361,7 @@ def create_app(session_factory: async_sessionmaker[AsyncSession]) -> FastAPI:
         """
         return {"status": "training trigger — wire up via main.py"}
 
-    @app.get("/export", dependencies=[RequireApiKey])
+    @app.get("/export", dependencies=[RequireAdmin])
     @limiter.limit("5/minute")
     async def export_data(request: Request) -> dict[str, Any]:
         """Export training data CSV.
@@ -396,15 +382,15 @@ def create_app(session_factory: async_sessionmaker[AsyncSession]) -> FastAPI:
     ) -> None:
         """Real-time launch feed over WebSocket.
 
-        Authentication is via ?token=<DASHBOARD_API_KEY> query param because
+        Authentication is via ?token=<ADMIN_API_KEY> query param because
         the browser WebSocket API does not support custom request headers.
 
         Why protected: The feed reveals live deployer wallets and risk
         scores in real time, giving adversaries early warning.
         """
         # Validate token before accepting the connection
-        if settings.dashboard_api_key and not secrets.compare_digest(
-            token.encode(), settings.dashboard_api_key.encode()
+        if settings.admin_api_key and not secrets.compare_digest(
+            token.encode(), settings.admin_api_key.encode()
         ):
             await ws.close(code=1008)  # Policy Violation
             return
@@ -424,3 +410,4 @@ def create_app(session_factory: async_sessionmaker[AsyncSession]) -> FastAPI:
             logger.debug("WebSocket client disconnected")
 
     return app
+
