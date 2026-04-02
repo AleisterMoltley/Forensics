@@ -23,6 +23,7 @@ from src.queue import AnalysisQueue
 from src.metrics import metrics, track_scan, track_alert_sent, set_ws_connected
 from src.telegram_bot import TelegramAlerts
 from src.dashboard import create_app
+from src.mcap_tracker import McapMilestoneTracker
 from src.rpc import rpc
 
 
@@ -50,6 +51,7 @@ class ForensicsBot:
         self.post_rug_tracker = None
         self.channel = None
         self.queue = None
+        self.mcap_tracker = None
         self.dashboard_app = None
         self._shutdown = False
         self._start_time = None
@@ -159,7 +161,14 @@ class ForensicsBot:
             await self.queue.connect()
             await self.queue.start_workers(self._process_queued_launch)
 
-        # 16. Start all background tasks
+        # 16. Init mcap milestone tracker
+        self.mcap_tracker = McapMilestoneTracker(
+            session_factory=self.session_factory,
+            pipeline=self.pipeline,
+            telegram=self.telegram,
+        )
+
+        # 17. Start all background tasks
         tasks = [
             dashboard_task,
             asyncio.create_task(self.pump_listener.start(), name="pump_fun"),
@@ -172,10 +181,18 @@ class ForensicsBot:
         if settings.post_rug_tracker_enabled:
             tasks.append(asyncio.create_task(self.post_rug_tracker.start(), name="post_rug_tracker"))
 
+        if settings.mcap_milestone_list:
+            tasks.append(asyncio.create_task(self.mcap_tracker.start(), name="mcap_tracker"))
+
+        milestones = settings.mcap_milestone_list
+        ms_str = ", ".join(f"${m:,.0f}" for m in milestones) if milestones else "OFF"
+
         logger.info("✅ All systems online")
         logger.info(f"   Dashboard: http://{settings.dashboard_host}:{settings.dashboard_port}")
         logger.info(f"   Telegram alerts: {'ON' if settings.telegram_bot_token else 'OFF'}")
         logger.info(f"   Alert threshold: {settings.min_risk_score_alert}/100")
+        logger.info(f"   Min mcap alert: {'$' + f'{settings.min_mcap_alert:,.0f}' if settings.min_mcap_alert > 0 else 'OFF'}")
+        logger.info(f"   Mcap milestones: {ms_str}")
         logger.info(f"   Outcome tracker: ON (1h/6h/24h checks)")
         logger.info(f"   Migration listener: ON")
         logger.info(f"   ML model: {'LOADED' if self.auto_retrainer.predictor.is_ready else 'WAITING FOR DATA'}")
@@ -412,6 +429,8 @@ class ForensicsBot:
             await self.auto_retrainer.stop()
         if self.post_rug_tracker:
             await self.post_rug_tracker.stop()
+        if self.mcap_tracker:
+            await self.mcap_tracker.stop()
         if self.queue:
             await self.queue.stop_workers()
             await self.queue.close()

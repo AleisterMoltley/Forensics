@@ -58,6 +58,11 @@ class SniperBridge:
         if not mint:
             return None
 
+        # Skip tokens below minimum mcap
+        mcap = getattr(result, "mcap", None)
+        if settings.min_mcap_alert > 0 and mcap is not None and mcap < settings.min_mcap_alert:
+            return None
+
         signal = {
             "action": "buy",
             "mint": mint,
