@@ -17,12 +17,21 @@ source .venv/bin/activate
 
 # Install deps
 echo "📦 Installing dependencies..."
-pip install -q -r requirements.txt
+pip install -q --require-hashes -r requirements.txt
 pip install -q ruff pytest pytest-asyncio pytest-cov
 
 # Config
 if [ ! -f config/.env ]; then
-    cp config/.env.example config/.env
+    mkdir -p config
+    # .env.example lives at project root
+    if [ -f .env.example ]; then
+        cp .env.example config/.env
+    elif [ -f config/.env.example ]; then
+        cp config/.env.example config/.env
+    else
+        echo "⚠️  No .env.example found — creating empty config/.env"
+        touch config/.env
+    fi
     echo ""
     echo "⚙️  Created config/.env"
     echo "   REQUIRED: Fill in these values:"

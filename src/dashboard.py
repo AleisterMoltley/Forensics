@@ -7,8 +7,9 @@ Security design:
 - /health and /metrics are intentionally public so Railway's healthcheck
   and Prometheus scrapers work without credentials.
 - Rate limiting (slowapi) prevents brute-force and DoS on every endpoint.
-- WebSocket connections are authenticated via a ?token= query parameter
-  because browser WebSocket APIs cannot set custom headers.
+- WebSocket connections are authenticated via a message-based handshake
+  (client sends {"token": "..."} after connecting) to avoid leaking the
+  API key in URL query parameters, server logs, and browser history.
 - All address/mint inputs are validated with Pydantic v2 strict validators
   to prevent injection through query parameters.
 - Secrets are never echoed in error responses.
@@ -31,7 +32,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from config import settings
+from src.config import settings
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +110,13 @@ def require_admin(api_key: str | None = Security(_api_key_header)) -> None:
         python -c "import secrets; print(secrets.token_urlsafe(32))"
     """
     if not settings.admin_api_key:
-        # Auth disabled — acceptable only in local dev
+        if settings.is_railway:
+            # NEVER allow unauthenticated access in production
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="ADMIN_API_KEY not configured — set it in Railway variables",
+            )
+        # Auth disabled — local dev only
         return
 
     if not api_key or not secrets.compare_digest(
@@ -131,14 +138,30 @@ RequireAdmin = Depends(require_admin)
 # ---------------------------------------------------------------------------
 
 class _ConnectionManager:
-    """Tracks active WebSocket connections and broadcasts JSON payloads."""
+    """Tracks active WebSocket connections and broadcasts JSON payloads.
+
+    Limits the number of concurrent connections to prevent memory
+    exhaustion from connection-flooding attacks.
+    """
+
+    MAX_CONNECTIONS: int = 50
 
     def __init__(self) -> None:
         self._connections: list[WebSocket] = []
 
-    async def connect(self, ws: WebSocket) -> None:
-        await ws.accept()
+    async def connect(self, ws: WebSocket) -> bool:
+        """Track an already-accepted WebSocket connection.
+
+        Returns False (and does NOT add the connection) if the limit
+        has been reached.
+        """
+        if len(self._connections) >= self.MAX_CONNECTIONS:
+            logger.warning(
+                f"WebSocket connection limit reached ({self.MAX_CONNECTIONS})"
+            )
+            return False
         self._connections.append(ws)
+        return True
 
     def disconnect(self, ws: WebSocket) -> None:
         if ws in self._connections:
@@ -176,14 +199,39 @@ def create_app(session_factory: async_sessionmaker[AsyncSession]) -> FastAPI:
         openapi_url=None if settings.is_railway else "/openapi.json",
     )
 
-    # CORS — restrict to same origin in production; allow all in local dev
+    # CORS — explicit origin only. Never default to wildcard.
+    # Set CORS_ALLOW_ALL=true for local dev, DASHBOARD_ORIGIN for production.
+    cors_origins: list[str] = []
+    if settings.cors_allow_all and not settings.is_railway:
+        cors_origins = ["*"]
+    elif settings.dashboard_origin:
+        cors_origins = [settings.dashboard_origin]
+    elif settings.is_railway:
+        logger.warning(
+            "⚠️  DASHBOARD_ORIGIN not set on Railway — CORS will reject "
+            "all cross-origin requests. Set it to your Railway domain."
+        )
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"] if not settings.is_railway else [],
+        allow_origins=cors_origins,
         allow_credentials=False,
-        allow_methods=["GET"],
+        allow_methods=["GET", "POST"],
         allow_headers=["X-API-Key"],
     )
+
+    # M5: Security headers middleware
+    @app.middleware("http")
+    async def add_security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        if settings.is_railway:
+            response.headers["Strict-Transport-Security"] = (
+                "max-age=63072000; includeSubDomains"
+            )
+        return response
 
     # Attach limiter and its error handler
     app.state.limiter = limiter
@@ -194,21 +242,9 @@ def create_app(session_factory: async_sessionmaker[AsyncSession]) -> FastAPI:
     app.state.broadcast = manager.broadcast
 
     # -----------------------------------------------------------------------
-    # Public endpoints — no auth, accessible by Railway healthcheck/Prometheus
+    # Public endpoints — /health and /metrics are registered by main.py
+    # with full runtime data (uptime, WS status, ML model, queue depth).
     # -----------------------------------------------------------------------
-
-    @app.get("/health")
-    @limiter.limit("60/minute")
-    async def health(request: Request) -> dict[str, Any]:
-        """Railway healthcheck — always public."""
-        return {"status": "ok"}
-
-    @app.get("/metrics")
-    @limiter.limit("30/minute")
-    async def metrics_endpoint(request: Request) -> JSONResponse:
-        """Prometheus metrics — public so external scrapers work."""
-        # main.py replaces this with the real metrics export; this is a stub
-        return JSONResponse(content={"info": "metrics not yet initialised"})
 
     # -----------------------------------------------------------------------
     # Protected endpoints — require valid X-API-Key header (require_admin)
@@ -227,7 +263,7 @@ def create_app(session_factory: async_sessionmaker[AsyncSession]) -> FastAPI:
         that could be used for counter-intelligence by rug-pull operators.
         """
         from sqlalchemy import select, desc
-        from models import TokenLaunch
+        from src.models import TokenLaunch
 
         async with session_factory() as session:
             result = await session.execute(
@@ -263,7 +299,7 @@ def create_app(session_factory: async_sessionmaker[AsyncSession]) -> FastAPI:
         sensitive intelligence data.
         """
         from sqlalchemy import select, desc
-        from models import Deployer
+        from src.models import Deployer
 
         async with session_factory() as session:
             result = await session.execute(
@@ -295,7 +331,7 @@ def create_app(session_factory: async_sessionmaker[AsyncSession]) -> FastAPI:
         """
         _validate_solana_address(mint)  # raises ValueError → 422 if invalid
         from sqlalchemy import select
-        from models import TokenLaunch
+        from src.models import TokenLaunch
 
         async with session_factory() as session:
             result = await session.execute(
@@ -321,35 +357,8 @@ def create_app(session_factory: async_sessionmaker[AsyncSession]) -> FastAPI:
                 "launched_at": row.launched_at.isoformat() if row.launched_at else None,
             }
 
-    @app.get("/api/backtest", dependencies=[RequireAdmin])
-    @limiter.limit("5/minute")  # expensive — tighter limit
-    async def api_backtest(request: Request) -> dict[str, Any]:
-        """Run backtest engine against historical data.
-
-        Tighter rate limit: backtesting is CPU/DB intensive.
-        Why protected: Exposes model accuracy and internal scoring details.
-
-        Note: BacktestEngine lives in src/backtest.py which is part of the
-        wider src/ package wired up by main.py.  The import is deferred here
-        so that the dashboard can be imported independently (e.g. in tests)
-        without requiring the full src/ package to be available.
-        """
-        try:
-            from src.backtest import BacktestEngine  # deferred — see docstring
-            engine = BacktestEngine(session_factory)
-            result = await engine.run()
-            return result.to_dict()
-        except ImportError:
-            raise HTTPException(status_code=503, detail="Backtest engine not available")
-
-    @app.get("/api/metrics", dependencies=[RequireAdmin])
-    @limiter.limit("60/minute")
-    async def api_metrics_detail(request: Request) -> dict[str, Any]:
-        """Detailed JSON metrics (includes queue depth).
-
-        Why protected: Reveals internal throughput and queue state.
-        """
-        return {"info": "metrics endpoint — attach via main.py"}
+    # /api/backtest and /api/metrics are registered by main.py with
+    # full runtime context (session_factory, queue, predictor).
 
     @app.post("/api/train", dependencies=[RequireAdmin])
     @limiter.limit("2/minute")  # training is very expensive
@@ -359,43 +368,83 @@ def create_app(session_factory: async_sessionmaker[AsyncSession]) -> FastAPI:
         Why protected and rate-limited: Retraining is CPU-intensive and
         could be abused to degrade model quality through forced retrains.
         """
-        return {"status": "training trigger — wire up via main.py"}
+        # The AutoRetrainer instance is attached to app.state by main.py
+        retrainer = getattr(app.state, "auto_retrainer", None)
+        if retrainer is None:
+            return {"status": "error", "detail": "AutoRetrainer not initialized"}
+        try:
+            await retrainer._retrain_from_db()
+            ready = retrainer.predictor.is_ready
+            return {
+                "status": "ok",
+                "model_ready": str(ready),
+            }
+        except Exception as e:
+            logger.error(f"Manual retrain failed: {e}")
+            return {"status": "error", "detail": str(e)}
 
     @app.get("/export", dependencies=[RequireAdmin])
     @limiter.limit("5/minute")
-    async def export_data(request: Request) -> dict[str, Any]:
+    async def export_data(request: Request) -> Any:
         """Export training data CSV.
 
         Why protected: Contains full historical data including wallet
         addresses and outcome labels.
         """
-        return {"info": "export endpoint — wire up via main.py"}
+        from fastapi.responses import StreamingResponse
+        from src.analyzers.outcome_tracker import TrainingDataExporter
+        import io
+
+        exporter = TrainingDataExporter(session_factory)
+        csv_data = await exporter.export_csv()
+        return StreamingResponse(
+            io.StringIO(csv_data),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=forensics_training_data.csv"},
+        )
 
     # -----------------------------------------------------------------------
     # Authenticated WebSocket feed
     # -----------------------------------------------------------------------
 
     @app.websocket("/ws")
-    async def websocket_feed(
-        ws: WebSocket,
-        token: str = Query(default=""),
-    ) -> None:
+    async def websocket_feed(ws: WebSocket) -> None:
         """Real-time launch feed over WebSocket.
 
-        Authentication is via ?token=<ADMIN_API_KEY> query param because
-        the browser WebSocket API does not support custom request headers.
+        Authentication uses a message-based handshake: the client connects,
+        then sends a JSON message ``{"token": "<ADMIN_API_KEY>"}`` within
+        10 seconds.  This avoids exposing the API key in the URL (which
+        would leak into server access logs, browser history, and proxy logs).
 
         Why protected: The feed reveals live deployer wallets and risk
         scores in real time, giving adversaries early warning.
         """
-        # Validate token before accepting the connection
-        if settings.admin_api_key and not secrets.compare_digest(
-            token.encode(), settings.admin_api_key.encode()
-        ):
-            await ws.close(code=1008)  # Policy Violation
-            return
+        await ws.accept()
 
-        await manager.connect(ws)
+        # If no admin key is configured (dev mode), skip auth
+        if settings.admin_api_key:
+            import asyncio as _aio
+            import json as _json
+            try:
+                raw = await _aio.wait_for(ws.receive_text(), timeout=10.0)
+                payload = _json.loads(raw)
+                client_token = payload.get("token", "")
+                if not secrets.compare_digest(
+                    client_token.encode(), settings.admin_api_key.encode()
+                ):
+                    await ws.send_json({"error": "authentication failed"})
+                    await ws.close(code=1008)  # Policy Violation
+                    return
+                await ws.send_json({"status": "authenticated"})
+            except (_aio.TimeoutError, _json.JSONDecodeError, Exception):
+                await ws.close(code=1008)
+                return
+
+        accepted = await manager.connect(ws)
+        if not accepted:
+            await ws.send_json({"error": "too many connections"})
+            await ws.close(code=1013)  # Try Again Later
+            return
         logger.debug("WebSocket client connected")
         try:
             while True:
