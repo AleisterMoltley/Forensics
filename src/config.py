@@ -153,6 +153,22 @@ class Settings(BaseSettings):
     # Alert Settings
     min_risk_score_alert: int = 50
     alert_cooldown_seconds: int = 30
+    # Minimum market cap (USD) for a token to trigger a Telegram alert.
+    # Tokens below this mcap are scanned but not pinged.
+    # Set to 0 to disable the filter (alert on all tokens).
+    # e.g. MIN_MCAP_ALERT=5000 → only alert on tokens with ≥$5k mcap
+    min_mcap_alert: float = 0.0
+
+    # Market Cap Milestone Re-Scan
+    # When a token's mcap crosses these thresholds, it gets re-scanned
+    # and a milestone alert is sent.  Comma-separated USD values.
+    # e.g. MCAP_MILESTONES=100000,300000,1000000
+    # The bot tracks which milestones each token has already triggered
+    # to avoid duplicate alerts.
+    # Set to empty string to disable milestone tracking.
+    mcap_milestones: str = "100000,300000,1000000"
+    # How often (seconds) to check tracked tokens for milestone crossings.
+    mcap_check_interval: int = 120
 
     # Scan Settings
     scan_concurrency: int = 5
@@ -255,6 +271,22 @@ class Settings(BaseSettings):
             if part.isdigit():
                 ids.add(int(part))
         return frozenset(ids)
+
+    @property
+    def mcap_milestone_list(self) -> list[float]:
+        """Parsed and sorted list of mcap milestone thresholds."""
+        if not self.mcap_milestones.strip():
+            return []
+        milestones: list[float] = []
+        for part in self.mcap_milestones.split(","):
+            part = part.strip().lower().replace("$", "").replace("k", "000").replace("m", "000000")
+            try:
+                v = float(part)
+                if v > 0:
+                    milestones.append(v)
+            except ValueError:
+                continue
+        return sorted(milestones)
 
     class Config:
         env_file = "config/.env"

@@ -153,6 +153,7 @@ class TelegramAlerts:
             ("bundler", self._cmd_bundler), ("lookup", self._cmd_lookup),
             ("stats", self._cmd_stats), ("top", self._cmd_top),
             ("watchlist", self._cmd_watchlist), ("threshold", self._cmd_threshold),
+            ("mcap", self._cmd_mcap), ("milestones", self._cmd_milestones),
             ("mute", self._cmd_mute), ("unmute", self._cmd_unmute),
             ("export", self._cmd_export), ("train", self._cmd_train),
             ("backtest", self._cmd_backtest),
@@ -187,6 +188,12 @@ class TelegramAlerts:
         if score < settings.min_risk_score_alert:
             return
 
+        # Market cap filter — skip tokens below minimum mcap
+        mcap: float | None = getattr(result, "mcap", None)
+        if settings.min_mcap_alert > 0 and mcap is not None and mcap < settings.min_mcap_alert:
+            return
+        # If mcap is None (unavailable), still alert — don't silently drop
+
         mint = getattr(result, "mint", "?")
         source = getattr(result, "source", "?")
         name = getattr(result, "name", "")
@@ -203,6 +210,16 @@ class TelegramAlerts:
 
         token = f"{name} (${symbol})" if name else f"{mint[:16]}…"
         src = "Pump.fun" if source == "pump_fun" else "Raydium"
+
+        # Market cap line
+        mcap_str = ""
+        if mcap is not None and mcap > 0:
+            if mcap >= 1_000_000:
+                mcap_str = f"  ·  💰 ${mcap/1_000_000:.1f}M"
+            elif mcap >= 1_000:
+                mcap_str = f"  ·  💰 ${mcap/1_000:.1f}K"
+            else:
+                mcap_str = f"  ·  💰 ${mcap:.0f}"
 
         # Bundler flags from bundle_data
         bd = getattr(result, "bundle_data", {}) or {}
@@ -225,7 +242,7 @@ class TelegramAlerts:
         msg = (
             f"{_remoji(score)} <b>RISK ALERT — {_rlabel(score)}</b>\n{SEP}\n"
             f"🪙 <b>{token}</b>\n"
-            f"📍 {src}  ·  ⚠️ <b>{score:.0f}/100</b>\n"
+            f"📍 {src}  ·  ⚠️ <b>{score:.0f}/100</b>{mcap_str}\n"
             f"🔑 <code>{mint}</code>\n\n"
             f"<pre>{dims_text}</pre>"
             f"{flags_sec}{dep_sec}\n"
@@ -276,6 +293,8 @@ class TelegramAlerts:
             "<b>⚙️ Control</b>\n"
             "  /status — System health, uptime, counters\n"
             "  /threshold &lt;0-100&gt; — Set minimum alert score\n"
+            "  /mcap &lt;amount&gt; — Set minimum market cap filter (e.g. /mcap 5k)\n"
+            "  /milestones &lt;vals&gt; — Set mcap re-scan thresholds (e.g. /milestones 100k,300k,1m)\n"
             "  /mute / /unmute — Pause or resume alerts\n"
             "  /train — Force ML model retrain\n"
             "  /export — Download full CSV dataset\n",
@@ -286,11 +305,13 @@ class TelegramAlerts:
 
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         oc = len(settings.owner_id_set)
+        mcap_status = f"${settings.min_mcap_alert:,.0f}" if settings.min_mcap_alert > 0 else "OFF"
         await update.message.reply_text(
             f"🤖 <b>System Status</b>\n{SEP}\n\n"
             f"  Status:    {'🟢 ONLINE' if self._alerts_enabled else '🔇 MUTED'}\n"
             f"  Uptime:    {_uptime(self._start_time)}\n"
             f"  Threshold: {settings.min_risk_score_alert}/100\n"
+            f"  Min mcap:  {mcap_status}\n"
             f"  Owners:    {oc} configured\n\n"
             f"  Scans:     {self._scans_total}\n"
             f"  Alerts:    {self._alerts_sent}\n",
@@ -807,6 +828,76 @@ class TelegramAlerts:
             await update.message.reply_text(f"✅ Threshold → <b>{v}/100</b> (persisted)", parse_mode=ParseMode.HTML)
         except (ValueError, AssertionError):
             await update.message.reply_text("❌ Must be 0-100.")
+
+    # ── /mcap ─────────────────────────────────────────────────────────
+
+    @_owner_only
+    async def _cmd_mcap(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not context.args:
+            current = settings.min_mcap_alert
+            if current > 0:
+                await update.message.reply_text(
+                    f"Current: <b>${current:,.0f}</b> minimum mcap\n"
+                    f"Usage: /mcap &lt;amount&gt;  (e.g. /mcap 5000)\n"
+                    f"Set to 0 to disable.",
+                    parse_mode=ParseMode.HTML)
+            else:
+                await update.message.reply_text(
+                    "Mcap filter: <b>OFF</b> (alerting on all tokens)\n"
+                    "Usage: /mcap &lt;amount&gt;  (e.g. /mcap 5000)",
+                    parse_mode=ParseMode.HTML)
+            return
+        try:
+            v = float(context.args[0].replace(",", "").replace("$", "").replace("k", "000").replace("K", "000"))
+            assert v >= 0
+            settings.min_mcap_alert = v
+            if v > 0:
+                await update.message.reply_text(f"✅ Min mcap → <b>${v:,.0f}</b>", parse_mode=ParseMode.HTML)
+            else:
+                await update.message.reply_text("✅ Mcap filter <b>disabled</b> — alerting on all tokens.", parse_mode=ParseMode.HTML)
+        except (ValueError, AssertionError):
+            await update.message.reply_text("❌ Must be a number ≥ 0. Examples: /mcap 5000, /mcap 10k, /mcap 0")
+
+    # ── /milestones ───────────────────────────────────────────────────
+
+    @_owner_only
+    async def _cmd_milestones(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not context.args:
+            ms = settings.mcap_milestone_list
+            if ms:
+                ms_str = ", ".join(f"${m:,.0f}" for m in ms)
+                await update.message.reply_text(
+                    f"🎯 <b>Mcap Milestones</b>\n{SEP}\n\n"
+                    f"  Thresholds: {ms_str}\n"
+                    f"  Check interval: {settings.mcap_check_interval}s\n\n"
+                    f"When a token crosses a threshold, it gets re-scanned and you get a milestone alert.\n\n"
+                    f"Usage: /milestones &lt;val1,val2,...&gt;\n"
+                    f"Example: /milestones 50k,100k,500k,1m\n"
+                    f"Set to 0 to disable.",
+                    parse_mode=ParseMode.HTML)
+            else:
+                await update.message.reply_text(
+                    "🎯 Milestones: <b>OFF</b>\n\n"
+                    "Usage: /milestones &lt;val1,val2,...&gt;\n"
+                    "Example: /milestones 100k,300k,1m",
+                    parse_mode=ParseMode.HTML)
+            return
+
+        raw = " ".join(context.args).strip()
+        if raw in ("0", "off", "disable"):
+            settings.mcap_milestones = ""
+            await update.message.reply_text("✅ Milestones <b>disabled</b>.", parse_mode=ParseMode.HTML)
+            return
+
+        # Parse — accepts: 100000,300000 or 100k,300k,1m
+        settings.mcap_milestones = raw
+        parsed = settings.mcap_milestone_list
+        if not parsed:
+            await update.message.reply_text("❌ Could not parse milestones. Use comma-separated numbers (e.g. 100k,300k,1m).")
+            return
+
+        ms_str = ", ".join(f"${m:,.0f}" for m in parsed)
+        await update.message.reply_text(f"✅ Milestones → <b>{ms_str}</b>", parse_mode=ParseMode.HTML)
 
     # ── /mute & /unmute ───────────────────────────────────────────────
 

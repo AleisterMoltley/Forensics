@@ -49,6 +49,9 @@ class PipelineResult:
     contract_data: dict[str, Any] = field(default_factory=dict)
     social_data: dict[str, Any] = field(default_factory=dict)
 
+    # Market data
+    mcap: float | None = None
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "mint": self.mint,
@@ -65,6 +68,7 @@ class PipelineResult:
             "score_social": self.score_social,
             "bundle_data": self.bundle_data,
             "deployer_data": self.deployer_data,
+            "mcap": self.mcap,
         }
 
 
@@ -180,13 +184,29 @@ class ForensicPipeline:
 
             result.total_score = min(100.0, round(total, 1))
 
+            # --- Extract market cap from launch data ---
+            # Pump.fun WS events often include market_cap or marketCapSol
+            raw = launch.get("raw", {})
+            mcap = (
+                raw.get("usd_market_cap")
+                or raw.get("marketCapSol")  # SOL-denominated, rough proxy
+                or raw.get("market_cap")
+                or launch.get("mcap")
+            )
+            if mcap is not None:
+                try:
+                    result.mcap = float(mcap)
+                except (ValueError, TypeError):
+                    pass
+
             # --- Persist to database ---
             await self._persist(result)
 
             duration = (time.time() - start) * 1000
+            mcap_str = f" mcap=${result.mcap:,.0f}" if result.mcap else ""
             logger.info(
-                f"Pipeline: {mint[:16]}... → score={result.total_score} "
-                f"({duration:.0f}ms)"
+                f"Pipeline: {mint[:16]}... → score={result.total_score}"
+                f"{mcap_str} ({duration:.0f}ms)"
             )
 
             return result
@@ -368,6 +388,10 @@ class ForensicPipeline:
                     existing.score_social = result.score_social
                     existing.deployer_data = result.deployer_data
                     existing.bundle_data = result.bundle_data
+                    if result.mcap is not None:
+                        existing.current_mcap = result.mcap
+                        if existing.peak_mcap is None or result.mcap > existing.peak_mcap:
+                            existing.peak_mcap = result.mcap
                 else:
                     session.add(
                         TokenLaunch(
@@ -385,6 +409,8 @@ class ForensicPipeline:
                             score_social=result.score_social,
                             deployer_data=result.deployer_data,
                             bundle_data=result.bundle_data,
+                            current_mcap=result.mcap,
+                            peak_mcap=result.mcap,
                         )
                     )
 
